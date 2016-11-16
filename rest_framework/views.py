@@ -2,20 +2,24 @@
 Provides an APIView class that is the base of all views in REST framework.
 """
 from __future__ import unicode_literals
+
+from django.conf import settings
 from django.core.exceptions import PermissionDenied
+from django.db import models
 from django.http import Http404
+from django.http.response import HttpResponseBase
 from django.utils import six
 from django.utils.encoding import smart_text
 from django.utils.translation import ugettext_lazy as _
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework import status, exceptions
-from rest_framework.compat import HttpResponseBase, View
+from django.views.generic import View
+
+from rest_framework import exceptions, status
+from rest_framework.compat import set_rollback
 from rest_framework.request import Request
 from rest_framework.response import Response
 from rest_framework.settings import api_settings
 from rest_framework.utils import formatting
-import inspect
-import warnings
 
 
 def get_view_name(view_cls, suffix=None):
@@ -54,8 +58,7 @@ def exception_handler(exc, context):
     Returns the response that should be used for any given exception.
 
     By default we handle the REST framework `APIException`, and also
-    Django's built-in `ValidationError`, `Http404` and `PermissionDenied`
-    exceptions.
+    Django's built-in `Http404` and `PermissionDenied` exceptions.
 
     Any unhandled exceptions may return `None`, which will cause a 500 error
     to be raised.
@@ -72,19 +75,23 @@ def exception_handler(exc, context):
         else:
             data = {'detail': exc.detail}
 
+        set_rollback()
         return Response(data, status=exc.status_code, headers=headers)
 
     elif isinstance(exc, Http404):
         msg = _('Not found.')
         data = {'detail': six.text_type(msg)}
+
+        set_rollback()
         return Response(data, status=status.HTTP_404_NOT_FOUND)
 
     elif isinstance(exc, PermissionDenied):
         msg = _('Permission denied.')
         data = {'detail': six.text_type(msg)}
+
+        set_rollback()
         return Response(data, status=status.HTTP_403_FORBIDDEN)
 
-    # Note: Unhandled exceptions will raise a 500 error.
     return None
 
 
@@ -103,6 +110,9 @@ class APIView(View):
     # Allow dependency injection of other settings to make testing easier.
     settings = api_settings
 
+    # Mark the view as being included or excluded from schema generation.
+    exclude_from_schema = False
+
     @classmethod
     def as_view(cls, **initkwargs):
         """
@@ -111,8 +121,19 @@ class APIView(View):
         This allows us to discover information about the view when we do URL
         reverse lookups.  Used for breadcrumb generation.
         """
+        if isinstance(getattr(cls, 'queryset', None), models.query.QuerySet):
+            def force_evaluation():
+                raise RuntimeError(
+                    'Do not evaluate the `.queryset` attribute directly, '
+                    'as the result will be cached and reused between requests. '
+                    'Use `.all()` or call `.get_queryset()` instead.'
+                )
+            cls.queryset._fetch_all = force_evaluation
+
         view = super(APIView, cls).as_view(**initkwargs)
         view.cls = cls
+        view.initkwargs = initkwargs
+
         # Note: session based authentication is explicitly CSRF validated,
         # all other authentication is CSRF exempt.
         return csrf_exempt(view)
@@ -140,13 +161,13 @@ class APIView(View):
         """
         raise exceptions.MethodNotAllowed(request.method)
 
-    def permission_denied(self, request):
+    def permission_denied(self, request, message=None):
         """
         If request is not permitted, determine what kind of exception to raise.
         """
-        if not request.successful_authenticator:
+        if request.authenticators and not request.successful_authenticator:
             raise exceptions.NotAuthenticated()
-        raise exceptions.PermissionDenied()
+        raise exceptions.PermissionDenied(detail=message)
 
     def throttled(self, request, wait):
         """
@@ -298,7 +319,9 @@ class APIView(View):
         """
         for permission in self.get_permissions():
             if not permission.has_permission(request, self):
-                self.permission_denied(request)
+                self.permission_denied(
+                    request, message=getattr(permission, 'message', None)
+                )
 
     def check_object_permissions(self, request, obj):
         """
@@ -307,7 +330,9 @@ class APIView(View):
         """
         for permission in self.get_permissions():
             if not permission.has_object_permission(request, self, obj):
-                self.permission_denied(request)
+                self.permission_denied(
+                    request, message=getattr(permission, 'message', None)
+                )
 
     def check_throttles(self, request):
         """
@@ -350,11 +375,6 @@ class APIView(View):
         """
         self.format_kwarg = self.get_format_suffix(**kwargs)
 
-        # Ensure that the incoming request is permitted
-        self.perform_authentication(request)
-        self.check_permissions(request)
-        self.check_throttles(request)
-
         # Perform content negotiation and store the accepted info on the request
         neg = self.perform_content_negotiation(request)
         request.accepted_renderer, request.accepted_media_type = neg
@@ -362,6 +382,11 @@ class APIView(View):
         # Determine the API version, if versioning is in use.
         version, scheme = self.determine_version(request, *args, **kwargs)
         request.version, request.versioning_scheme = version, scheme
+
+        # Ensure that the incoming request is permitted
+        self.perform_authentication(request)
+        self.check_permissions(request)
+        self.check_throttles(request)
 
     def finalize_response(self, request, response, *args, **kwargs):
         """
@@ -405,22 +430,22 @@ class APIView(View):
 
         exception_handler = self.settings.EXCEPTION_HANDLER
 
-        if len(inspect.getargspec(exception_handler).args) == 1:
-            warnings.warn(
-                'The `exception_handler(exc)` call signature is deprecated. '
-                'Use `exception_handler(exc, context) instead.',
-                DeprecationWarning
-            )
-            response = exception_handler(exc)
-        else:
-            context = self.get_exception_handler_context()
-            response = exception_handler(exc, context)
+        context = self.get_exception_handler_context()
+        response = exception_handler(exc, context)
 
         if response is None:
-            raise
+            self.raise_uncaught_exception(exc)
 
         response.exception = True
         return response
+
+    def raise_uncaught_exception(self, exc):
+        if settings.DEBUG:
+            request = self.request
+            renderer_format = getattr(request.accepted_renderer, 'format')
+            use_plaintext_traceback = renderer_format not in ('html', 'api', 'admin')
+            request.force_plaintext_errors(use_plaintext_traceback)
+        raise
 
     # Note: Views are made CSRF exempt from within `as_view` as to prevent
     # accidental removal of this exemption in cases where `dispatch` needs to

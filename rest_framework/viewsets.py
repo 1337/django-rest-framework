@@ -19,9 +19,11 @@ automatically.
 from __future__ import unicode_literals
 
 from functools import update_wrapper
+
 from django.utils.decorators import classonlymethod
 from django.views.decorators.csrf import csrf_exempt
-from rest_framework import views, generics, mixins
+
+from rest_framework import generics, mixins, views
 
 
 class ViewSetMixin(object):
@@ -77,10 +79,6 @@ class ViewSetMixin(object):
                 handler = getattr(self, action)
                 setattr(self, method, handler)
 
-            # Patch this in as it's otherwise only present from 1.5 onwards
-            if hasattr(self, 'get') and not hasattr(self, 'head'):
-                self.head = self.get
-
             # And continue as usual
             return self.dispatch(request, *args, **kwargs)
 
@@ -95,7 +93,9 @@ class ViewSetMixin(object):
         # generation can pick out these bits of information from a
         # resolved URL.
         view.cls = cls
+        view.initkwargs = initkwargs
         view.suffix = initkwargs.get('suffix', None)
+        view.actions = actions
         return csrf_exempt(view)
 
     def initialize_request(self, request, *args, **kwargs):
@@ -104,7 +104,14 @@ class ViewSetMixin(object):
         depending on the request method.
         """
         request = super(ViewSetMixin, self).initialize_request(request, *args, **kwargs)
-        self.action = self.action_map.get(request.method.lower())
+        method = request.method.lower()
+        if method == 'options':
+            # This is a special case as we always provide handling for the
+            # options method in the base `View` class.
+            # Unlike the other explicitly defined actions, 'metadata' is implicit.
+            self.action = 'metadata'
+        else:
+            self.action = self.action_map.get(method)
         return request
 
 
